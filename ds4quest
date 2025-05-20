@@ -1,0 +1,764 @@
+#!/bin/bash
+#
+#Copyright (c) 2007  Martin J. Wanicki email: (withheld)
+#
+#Permission is hereby granted, free of charge, to any person obtaining a copy
+#of this software and associated documentation files (the "Software"), to deal
+#in the Software without restriction, including without limitation the rights
+#to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+#copies of the Software, and to permit persons to whom the Software is
+#furnished to do so, subject to the following conditions:
+#
+#The above copyright notice and this permission notice shall be included in
+#all copies or substantial portions of the Software.
+#
+#THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+#IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+#FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+#AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+#LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+#OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+#THE SOFTWARE.
+#
+#---------------------------------------------------------------------------
+# ds4quest (Downscale For Quest) - bash script to transcode 180 VR video
+# files for better performance on the original Oculus Quest.
+# Note that the target size can be modifies if a newer quest or vr device is able to handle
+# higher encoding specs
+#
+# documentation here : https://creator.oculus.com/blog/encoding-high-resolution-360-and-180-video-for-oculus-go/
+#           and here : https://developer.oculus.com/blog/techniques-for-improved-vr-video-w-john-carmack/
+# was consulted and my ffmpef commands was based on a combination from these docs
+# along with suggestions from a video on Creatorup's YouTube channel which you
+# can find here : https://www.youtube.com/watch?v=iBGjn4rmFJU
+#
+# hardware encoding via Nvidia graphics card was figured out using
+# https://docs.nvidia.com/video-technologies/video-codec-sdk/ffmpeg-with-nvidia-gpu/
+# as a starting point
+# also check your devices capability here https://en.wikipedia.org/wiki/Nvidia_NVDEC#GPU_support
+#
+#
+# The following was very useful and got me to a better result with quality over transcoding time
+# https://gist.github.com/thearchitect/1fb38b6b6bbb03d73ca310742ec9e561
+# theres a text version included in this package incase the original disappears
+# see "FFmpeg Cheat Sheet for 360º video.txt"
+#
+# Some other really useful posts and information that helped with this project:
+# https://superuser.com/questions/1656514/ffmpeg-failed-locking-bitstream-buffer-not-enough-buffer-14-35x-video-enc
+# Yup I had that problem scaling some h264 video down with hevc_nvenc - in this case
+# switching to h264_nvenc sort of solved my problem
+#
+# The previous link pointed me to two really good explanations:
+# https://superuser.com/questions/1630601/why-using-b-frames-does-not-reduce-the-size-of-my-video-using-ffmpeg-and-nvenc/1630606#1630606
+# AND
+# https://superuser.com/questions/1633516/convert-ffmpeg-encoding-from-libx264-to-h264-nvenc/1650962#1650962
+#
+# https://trac.ffmpeg.org/wiki/Limiting%20the%20output%20bitrate
+#
+#---------------------------------------------------------------------------
+# Usage :
+#       ds4quest =mw=Max Width -sf=source_folder
+#
+# Example:
+#       ds4quest -mw=4096 -sf=./myfolder
+#
+# the script will output a new file in a subfolder named ./.ds4quest_Transcoded in the
+# source folder
+#
+# the height will be auto adjusted preserving the original aspect ratio
+# file will be named including domensions and rate
+#
+# Source files wil be moved to ./.ds4quest_Source
+#
+# when I'm happy with the process I'll automate
+# moving the original files out of the way and placing the completed files
+# in their place. But only if the working directory is on a disk with
+# sufficient space.
+# file size doesnt change much here so replacing source with newly transcoded
+# automatically should be fine
+#
+#---------------------------------------------------------------------------
+# reminders for stuff I keep forgetting
+#---------------------------------------------------------------------------
+# A multiline string is called a heredoc.
+#   EOF without quotes expands contained variables
+#  'EOF' with quotes does not
+# my_var=$(cat <<'EOF'
+# foo bar
+# more text
+# EOF
+# )
+#
+#
+#
+# To Do:
+# Look into maybe reducing ffmpegs cpu usage a little, in case the
+# working computer needs to leave a little for other processes.
+# I encountered a little cpu hogging a few times.
+# This Doesn't really bother me.
+# Since this script will process all the files in a folder it
+# can take a while if you've queued up quite a few files, so I
+# just start a job and walk away.
+#---------------------------------------------------------------------------
+appname=ds4quest
+appvers=1.2
+versionstring="${appname} ${appvers} (${0})"
+#---------------------------------------------------------------------------
+# Edit the following variables to suit your needs
+#---------------------------------------------------------------------------
+# Recommended peak-quality resolutions are:
+#
+# 3D-360:
+# 3840x3840 30fps H264 H265
+# 4096x4096 30fps ---- H265
+# 2880x2880 60fps H264 H265
+#
+# 360 / 3D-180:
+# 5120x2560 30fps H264 ----
+# 2560x5120 30fps ---- H265 (*1)
+# 4096x2048 60fps H264 H265
+# MAXWIDTH and MAXRATE are the keys to good working transcode of VR video on the original Quest
+NVMAXWIDTH=4096
+MAXWIDTH=4096	#default width max for VR  maybe should be 5120
+#---------------------------------------------------------------------------
+# Video Bitrate
+MAXRATE='copy'  # use 'copy' as a flag to copy the Bitrate
+#---------------------------------------------------------------------------
+SRCFLDR=$(pwd)
+# STARTHERE=$(pwd)
+# MAXFPS=59 #we want to deal with FPS at 60 or 59.xx so greater than or equal to 59 should be good
+DRYRUN=False  #Change this to True for testing without actually touching files
+DEBUG=True   # This is only checked for existance - you could set it to anything
+unset DEBUG  # comment this out to disable debugging output
+# [ -x "${DEBUG}" ] || DRYRUN=True  # With this - script automatically goes into dryrun mode if $DEBUG is set
+
+THISUSER=$(whoami) # You'll see why if you keep reading
+# nice -ness :)  change this to suit your requirements
+# examples:
+NICE="nice -0"   #This is the default niceness - standard priority
+NICE="nice -2"   # 2 less than normal (Zero is normal) lower priority
+NICE="nice --19" #max out your cpus                    maximum priorit
+NICE="nice -19"  #hardly every touch the cpus          almost lowest priority
+NICE="nice -20"  #nicer than -90                       lowest priority
+NICE="nice --2"  # less nice than zero                 2 points higher than normal or zero
+NICE="sudo nice --5 sudo -u ${THISUSER}"   #Elevated Nicenessrequires sudo
+unset NICE     # you can use no nice-ness at all which is the same as the default niceness (nice -0)
+
+#---------------------------------------------------------------------------
+# ffmpeg=/usr/bin/ffmpeg
+# ffmpeg=/home/martin/dev/ffmpeg_build/bin/ffmpeg
+# ffmpeg=/usr/bin/ffmpeg
+# Hard coding is kinda not portable to keep it set with "which"
+ffmpeg=$(which ffmpeg)
+# ffmpeg=/home/martin/bin/ffmpeg
+mediainfo=$(which mediainfo)
+# nullfile="/dev/null"				# self explanitory
+# cwd=$(pwd)					        # Current Working Directory
+# echo=$(which echo)
+#change the following to suit - placing target on
+# a different physincal disk may speed things up
+new_source_dir="${SRCFLDR}/${appname}_source"
+# new_dest_folder="${SRCFLDR}/.${appname}_New"
+# new_dest_folder="/mnt/Some Other Disk/${appname}/Transcoded"  #This is just an example
+new_dest_folder="${SRCFLDR}/${appname}_transcoded"
+
+tab="\t"
+loglevel=info
+outlog=${appname}.log
+declare -A MediaInfo # Associative array to populate from mediainfo
+#---------------------------------------------------------------------------
+# ffmpeg logging levels:
+#            quiet, -8
+#                Show nothing at all; be silent.
+#
+#            panic, 0
+#                Only show fatal errors which could lead the process to crash, such as an assertion
+#                failure. This is not currently used for anything.
+#            fatal, 8
+#                Only show fatal errors. These are errors after which the process absolutely cannot
+#                continue.
+#
+#            error, 16
+#                Show all errors, including ones which can be recovered from.
+#${appname}
+#            warning, 24
+#                Show all warnings and errors. Any message related to possibly incorrect or unexpected
+#                events will be shown.
+#
+#            info, 32
+#                Show informative messages during processing. This is in addition to warnings and errors.
+#                This is the default value.
+#
+#            verbose, 40
+#                Same as "info", except more verbose.
+#
+#            debug, 48
+#                Show everything, including debugging information.
+#
+#            trace, 56
+#---------------------------------------------------------------------------
+# Usage String
+#---------------------------------------------------------------------------
+Usage="${versionstring}\n${tab}
+       Usage: ${0} [options]\n${tab} Basic options: \n${tab}
+       -h  | --help      ${tab}This Message\n${tab}
+       -mw | --maxwidth=<${MAXWIDTH}> or whatever you want the output maximun x-resolution to be\n${tab}
+       -mr | --maxrate=<${MAXRATE}> or whatever you want the output maximun bitrate to be\n${tab}
+       -sf | --srcfldr=<some_folder> Whaterver folder contains your source files \n${tab}
+             ${tab} currently default is ${SRCFLDR}\n${tab}
+       -dr | --dryrun  - just show what would be done (ffmpeg command line-etc)\n${tab}
+             ${tab} dont process any files - (requires -sf)\n"
+
+#---------------------------------------------------------------------------
+# exit Handler
+#---------------------------------------------------------------------------
+fin(){
+  echo  "${versionstring} : ${1} - Done!"
+	exit 0
+}
+
+#---------------------------------------------------------------------------
+# Error Handler
+#---------------------------------------------------------------------------
+die(){
+  echo  -e "${versionstring}\n\n\t${1}\n" >/dev/stderr
+	exit 1
+}
+
+#---------------------------------------------------------------------------
+# log
+#---------------------------------------------------------------------------
+log(){
+  echo  -e "$@"
+  echo  -e "$@" >> "${outlog}"
+}
+
+#---------------------------------------------------------------------------
+# dryrun
+#---------------------------------------------------------------------------
+dryrun(){
+	# echo -e "dryrun:  $@"
+  log "dryrun:  " "${@}"
+}
+
+#---------------------------------------------------------------------------
+# debug log - add some debugging to the log and output
+#---------------------------------------------------------------------------
+Dlog() {
+  # Only print stuff out if DEBUG is set
+  if [ ! -z $DEBUG ]
+  then
+    log "$*"
+  fi
+}
+
+# ------------------------------------------------------------------------
+# Sanity check for the software we need
+#---------------------------------------------------------------------------
+sanitycheck(){
+  # I checked - it seems -f will return true if the file exists (expected)
+  # It will also return true if the file path your checking points to, is an existing file
+  # Check for yourself with all the different python version links in /usr/bin
+  # eg /usr/sbin/python usually points to whatever version you installed as the
+  # version you use the most.
+  # mine points to /usr/bin/python3.10 and
+  # [ -f /usr/bin/python ] && echo "Python exists" || echo "Python has fallen of the twig"
+  # yields "Python exists"
+  [ -f "${ffmpeg}" ] || die "ffmpeg not installed\tso quitting..\n\n\tTo install ffmpeg on ubuntu...\n\nsudo apt install ffmpeg"
+  [ -f "${mediainfo}" ] || die "mediainfo not installed\tso quitting..\n\n\tTo install mediainfo on ubuntu...\n\nsudo apt install mediainfo"
+}
+
+#---------------------------------------------------------------------------
+# Make sure we have all the sofware we need
+#---------------------------------------------------------------------------
+sanitycheck
+
+#---------------------------------------------------------------------------
+#Check the command line contains only legal options
+#---------------------------------------------------------------------------
+checkopt(){
+	legalopt=0
+	for co in  help maxwidth srcfldr dryrun move_completed h mw sf dr mc
+	do
+		if [ ${1} = ${co} ]
+		then
+      #expand the short-form arguments
+      if [ "${1}" = "h"  ]; then parameter=help; fi
+      if [ "${1}" = "mw" ]; then parameter=maxwidth ; fi
+      if [ "${1}" = "mr" ]; then parameter=maxrate ; fi
+      if [ "${1}" = "sf" ]; then parameter=srcfldr ; fi
+      if [ "${1}" = "dr" ]; then parameter=dryrun ; fi
+			legalopt=1
+			break
+		fi
+	done
+}
+
+#---------------------------------------------------------------------------
+#
+# Parse the command line arguments
+#
+# Function to get the arguments off the command line.
+# NOT perfect but it works for me!
+# Here's a good primer I found long after I wrote this little script
+# https://linuxsimply.com/bash-scripting-tutorial/functions/script-argument/bash-optarg/
+#--------------------------------------------------------------------------
+parse_cmdline(){
+	cmdline="$@"	  # Make a copy so we still have it to display after its
+                  # been shifted to nothing
+	until [ -z "$1" ]
+	do
+		tmp='0'
+		if [ ${1:0:1} = '-' ]
+		then
+			if [ ${1:0:2} = '--' ]
+			then
+				tmp=${1:2}
+			else
+				tmp=${1:1}
+			fi
+		fi
+
+		if [ $tmp != '0' ]
+		then
+			parameter=${tmp%%=*}     # Extract name.
+			checkopt $parameter
+			if [ $legalopt = '0' ]
+			then
+				helpreason="Unknown Option : $1"
+        break
+			fi
+			value=${tmp##*=}         # Extract value.
+      #make the switches into arg/value pairs
+      if [ "${parameter}" == "dryrun" ]; then value=dryrun ; fi
+  		#echo $parameter=$value
+      eval $parameter=$value   # If the parameter happens to be, say 'verbose'
+                               # create a vaiable called verbose and set it to have the value out of the value variable
+                               # In the case of dryrun - point the variable dryrun to the function dryrun
+			if [ $parameter = 'help' ]
+			then
+				helpreason='Help Requested'
+			fi
+		else
+			helpreason="Unknown Option : $1"
+			break
+		fi
+		shift
+	done
+
+  # Bail out if the helpreason variable is not empty
+  if [ ! -z "$helpreason" ]
+	then
+		echo  $helpreason
+		echo  -e ${Usage}
+		exit 0
+	fi
+
+
+	if [ -z "$cmdline" ]
+	then
+    s="$0: No Command line - using defaults: "
+    if [ ${DRYRUN} == "True" ]
+    then
+      s="$s --dryrun (set in script)"
+      dryrun=dryrun
+      echo  "Dry Run"
+    fi
+    s="$s --maxwidth=${MAXWIDTH} --srcfldr=${SRCFLDR} "
+    echo  "${s}"
+    srcfldr=${SRCFLDR}
+    maxwidth=${MAXWIDTH}
+    maxrate=${MAXRATE}
+	else
+    line=""
+    if [ -z "${maxwidth}" ]; then maxwidth=${MAXWIDTH}; line="${line} --maxwidth=${MAXWIDTH}" ;else line="${line} --maxwidth=${maxwidth}" ;fi
+    if [ -z "${maxrate}" ]; then maxrate=${MAXRATE}; line="${line} --maxrate=${MAXRATE}" ;else line="${line} --maxrate=${maxrate}" ;fi
+    if [ -z "${srcfldr}" ]; then srcfldr=${SRCFLDR}; line="${line} --srcfldr=${SRCFLDR}" ; else line="${line} --srcfldr=${srcfldr}"; fi
+    if [ -z "${dryrun}" ]; then dryrun=dryrun; line="${line} --dryrun" ;  else line="${line} --dryrun";fi
+    echo "$0: using : ${line}"
+	fi
+}
+
+
+#---------------------------------------------------------------------------
+# Rerieve media info fro a file and populate an array with
+# the appropriatel massaged results
+#---------------------------------------------------------------------------
+get_mi(){
+        if [ $# -eq 0 ]
+        then
+            Print "No arguments supplied ...bailing out"
+            exit
+        else
+            f=${1}
+        fi
+        MediaInfo=() #Clear the array for re-use
+
+        declare -a interest=( "Width" "Height" "FrameRate"
+                              "Duration" "Duration/String3" "AspectRatio" "BitRate"
+                              "BitRate_Mode" "Format" # "DisplayAspectRatio/String"
+                             )
+
+        request=""
+        l=${#interest[@]}
+        x=1
+        for qry in "${interest[@]}"; do
+          request="${request}${qry}=%${qry}%"
+          [ ${x} -lt ${l} ] && request="${request},"
+          ((x+=1))
+        done
+        inf=$(mediainfo --Inform="Video;${request}" "${f}" )
+        # DPrint "inf=   $inf"
+        OIFS=$IFS
+        IFS="," read -r -a parts <<< "$inf"
+        for part in "${parts[@]}"; do
+          key="${part%=*}"
+          value="${part#*=}"
+          # key=${key//\//'_'}  #strip out dashes
+          MediaInfo[$key]="${value}"
+        done
+
+        # Bitrate to kbps
+        MediaInfo["BitRate"]=$(echo "scale=0; ${MediaInfo['BitRate']}/1000" | bc)
+        #Duration to minutes and/or seconds
+        Mins=$(echo "scale=0; ${MediaInfo['Duration']}/60000" | bc)
+        Secs=$(printf %.0f ${MediaInfo['Duration/String3']##*:})
+        label='Min'
+        displaytime=$Mins
+        if [ $Mins -lt 1 ] ; then
+          label='Sec'
+          displaytime=$Secs
+        fi
+        MediaInfo["DurationMin"]=$Mins
+        MediaInfo["DurationSec"]=$Secs
+        MediaInfo["DisplayTime"]="${displaytime}$label"
+        unset ${MediaInfo['Duration/String3']}
+
+        IFS=$OIFS
+        #Check for scale where width is 2(ish) times height - most likeley VR 180
+        #Assume all videos are 2D - then try and figure out if this true
+        MediaInfo["DisplayMode"]="2D"
+
+        if (( $(echo "${MediaInfo['AspectRatio']} == 2.0"  |bc -l ) ))
+        then
+          MediaInfo["DisplayMode"]="VR SBS"
+          # MediaInfo["VRMode"]="SBS"
+        fi
+        if (( $(echo "${MediaInfo['Height']} > ${MediaInfo['Width']}"  |bc -l ) ))
+        then
+          MediaInfo["DisplayMode"]="VR TB"
+          # MediaInfo["VRMode"]="TB"
+        fi
+
+}
+
+#---------------------------------------------------------------------------
+# Build a new clean filename including encoding info
+#---------------------------------------------------------------------------
+get_newname(){
+  fn=$(basename -- "${1}")
+  # Dlog "basename: \n\t'$fn'"
+  ext=${fn##*.} #extension
+  # Start cleaning the file name
+  cn=${fn%.*}      # basename less the extension
+  # replace stupid file name punctuation
+  cn=${cn//-/' '}  #replace dashes with spaces
+  cn=${cn//_/' '}  #underscores with spaces
+  cn=${cn//+/' '}  #replace plus signs with spaces
+
+  cn=$(echo $cn | sed 's/\[[^]]*\]//g' ) #strip anything inside square braces including the braces
+  cn=$(echo $cn | sed 's/([^()]*)//g' ) #strip anything inside round brackets including the brackets
+  cn="${cn#"${cn%%[![:space:]]*}"}" # remove leading whitespace characters
+  cn="${cn%"${cn##*[![:space:]]}"}"     # remove trailing whitespace characters
+  # cn=${cn%%*( )} #remove leading space duplicates
+  # cn=${cn##*( )} #remove trailing space duplicates
+
+  # Start cleaning the file extension - probably unnecessary
+  ext="${ext#"${ext%%[![:space:]]*}"}" # remove leading whitespace characters
+  ext="${ext%"${ext##*[![:space:]]}"}"     # remove trailing whitespace characters
+  # ext=${ext%%*( )} #remove leading space duplicates
+  # ext=${ext##*( )} #remove trailing space duplicates
+
+  cn=${cn,,}       #lowercase the whole thing - easier to check for stuff - might be redundant here tho
+
+  # build the template from mediainfo
+  tmplt="${MediaInfo['Width']}x${MediaInfo['Height']} ${MediaInfo['DisplayTime']}"
+  [ "${MediaInfo['DisplayMode']}"  != "2D" ]  && tmplt="$tmplt ${MediaInfo['DisplayMode']}"
+
+  cn=$(printf "%s" "$cn" | sed 's/.*/\L&/; s/[a-z]*/\u&/g')  #Title{DDD} Case
+  # Dlog "Title case filename: \n\t'$cn'"
+  target_basename="${cn}(${tmplt})"
+  # Dlog "Template: \n\t'$tmplt'"
+  # log "Target Basename: \n\t'$target_basename'"
+  # Dlog "Extension: \n\t'$ext'"
+  target_file="${target_basename}.${ext}"
+  logfile="${target_basename}.log"
+  # log "target_file \n\t'${target_file}'"
+}
+
+
+#---------------------------------------------------------------------------
+# Do some bitrate math (previous versions had much more in here)
+#---------------------------------------------------------------------------
+calc_bitrates(){
+  perc=$(echo "scale=2; ( ${MAXWIDTH}/${MediaInfo['Width']} )" | bc) # perc gets using in the main process
+  # Unless the max bitrate has been set for the target file
+  # just copy the bitrate from the source file
+  if [ "${MAXRATE}" == copy ]
+  then
+    maxrate="${MediaInfo['BitRate']}K"
+  fi
+}
+
+#---------------------------------------------------------------------------
+# Do The Work - From here on down
+#---------------------------------------------------------------------------
+
+#---------------------------------------------------------------------------
+# Parse the command line
+#---------------------------------------------------------------------------
+parse_cmdline $*
+#---------------------------------------------------------------------------
+#
+#
+
+
+
+# ${dryrun} mkdir -pv "${new_dest_folder}"
+
+# echo -e "for f in ${srcfldr}/*.mp4"
+# cd ${srcfldr}
+
+for f in "${srcfldr}/"*.mp4
+do
+  if [ -f "${f}" ]
+  then
+    # retrieve everything we want to know about this file
+    get_mi "${f}"  # Populates the MediaInfo Associative array
+
+    # only transcode stuff with wider than ${maxwidth}
+    if [ ${MediaInfo['Width']} -le ${maxwidth} ]
+    then
+      echo -e "File is ${MediaInfo['Width']} wide.\nThis is less than or equal to ${maxwidth} wide.\nConforms - so skipping"
+      continue # on to the next iteration
+    fi
+
+    get_newname "${f}" # sets up our new file name ${target_file}
+
+    if [ -z "${dryrun}" ]  # Make a directory if we are not in a dry run
+    then                   # set up an appropriate log file
+      [ -d "${new_dest_folder}" ] || mkdir -p "${new_dest_folder}"
+      outlog=${new_dest_folder}/${target_basename}" [ TRANSCODING... ].log"
+    else
+      outlog=${srcfldr}/${target_basename}" [ TRANSCODING... ].log"
+    fi
+    # shopt -u extglob
+    echo  > "${outlog}"  #initialize our log file
+    echo "Logging to \n\t${outlog}"
+    Dlog "Processing : \n\t${f}"
+
+    Dlog "New file name (target_file) \n\t'${target_file}'"
+    Dlog "New source folder (new_source_dir) is \n\t${new_source_dir}"
+    Dlog "New dest folder (new_dest_folder) is \n\t${new_dest_folder}"
+    # shopt -s extglob
+
+    [ -d "${new_source_dir}" ] || ${dryrun} mkdir -p "${new_source_dir}"
+    ${dryrun} mv "${f}" "${new_source_dir}/${target_file}"
+    Source_file="${new_source_dir}/${target_file}"
+    Dlog "Source file for encoding :\n\tIn ${new_source_dir}\n\t'${target_file}'"
+
+    # Temporary name while encoding
+    Output_file="${target_basename}[ TRANSCODING... ].${ext}"
+    Dlog "Temporary file for encoding output:\n\tIn ${new_dest_folder}\n\t'${Output_file}'"
+    Output_file="${new_dest_folder}/${Output_file}"
+
+    if [ ! -f  "${Output_file}" ]
+		then
+        calc_bitrates
+        # # Exerpt from FFMpeg docs:
+        # #
+        # # The range of the CRF scale is 0–51, where 0 is lossless (for 8 bit only, for 10 bit use -qp 0),
+        # # 23 is the default, and 51 is worst quality possible. A lower value generally leads to higher quality,
+        # # and a subjectively sane range is 17–28.
+        # #
+        # # Consider 17 or 18 to be visually lossless or nearly so; it should look the same or nearly the
+        # # same as the input but it isn't technically lossless.
+        # #
+        # # The range is exponential, so increasing the CRF value +6 results in roughly half the
+        # # bitrate / file size, while -6 leads to roughly twice the bitrate.
+        # #
+        # # Choose the highest CRF value that still provides an acceptable quality.
+        # # If the output looks good, then try a higher value. If it looks bad, choose a lower value.
+        # #
+        # -----------------------------------------------------------------------------------------------
+        # cheat Sheet I found on the web - this sounds a little contra to the ffmpeg docs
+        # *** CRF 20-23 for most 1080p videos is enough. x265 uses CRF 18 by default. Use CRF 23+ for videos in 4K. ***
+        # ### To Encode video as x265 HEVC 10bit.
+        # ffmpeg -i "input.mkv" -pix_fmt yuv420p10le -c:v libx265 -preset slow -crf 28 -c:a copy -x265-params profile=main10 "output".mkv
+        # ### Same as above, but as a two-pass x265 HEVC 10bit encode.
+        # ffmpeg -y -i "input".mkv -c:v libx265 -b:v 1500k -x265-params pass=1 -an -f null /dev/null && \
+        # ffmpeg -i "input".mkv -c:v libx265 -b:v 1500k -x265-params pass=2 -c:a copy "output".mkv
+        #
+        # maybe use lanczos since we are always down scaling "scale=1280:-2:flags=lanczos,format=yuv420p"
+        #
+        # -----------------------------------------------------------------------------------------------
+        # My notes:
+        #
+        # keep in mind that hw encoding with Nvidia at the time of writing was limited to max width of 4096
+        #
+        # Dont do this: -maxrate ${maxrate}  -bufsize 100M
+        # as in :
+        # codec=libx264 -preset fast -crf ${CRF} -maxrate ${maxrate}  -bufsize 100M -x264-params mvrange=511
+        # codec=libx265 -preset fast -crf ${CRF} -maxrate ${maxrate}  -bufsize 100M
+        #
+        # Note that upon further reading -maxrate and buffsize settings I tried were very incorrect
+        # check this document https://trac.ffmpeg.org/wiki/Limiting%20the%20output%20bitrate
+        # Excerpt:
+        # Note: Constraining the bitrate might result in low quality output if the video is hard to encode.
+        # In most cases (such as storing a file for archival), letting the encoder choose the proper bitrate
+        # is the constant quality or CRF-based encoding.
+        #
+        # codec=h264_nvenc # works ok -  with -b:v ${maxrate}
+        # by makes ugly, really big files using -preset fast -crf 18 -maxrate 35M
+        # which is to be expected with the fast preset
+        # The slower the preset the better the output quality - good things take time :)
+        #
+        # codec=hevc_nvenc # works a treat
+        #
+        if [ "${MAXWIDTH}" -gt "${NVMAXWIDTH}" ]
+        then
+            codec="libx265"  # or for multiple params
+            # codec="libx265 -x265-params \"bitrate=${maxrate}:keyint-1:lossless=1\""  # or for multiple params
+        else
+          if [ "${MediaInfo['Format']}" == "AVC" ]  #hevc_nvenc seems to stuff up some h264 files with low bitrates, cant quite figure this out
+          then
+            codec=h264_nvenc
+          else
+            codec=hevc_nvenc
+          fi
+          codec="${codec} -b:v ${maxrate} -preset p5"
+        fi
+
+        log  "\n============================================" # | tee -a "${outlog}"
+        log  "Transcoding :\n____________" # | tee -a "${outlog}"
+        log  "source folder :\n\t${new_source_dir}"  # | tee -a "${outlog}"
+        log  "output folder :\n\t${new_dest_folder}"  # | tee -a "${outlog}"
+        # log  "Source file   :"$(basename -- "${f}")  # | tee -a "${outlog}"
+        log  "Encoding  :\n\t$(basename -- \"${Source_file}\")"  # | tee -a "${outlog}"
+        log  "To :\n\t$(basename -- \"${Output_file}\")"  # | tee -a "${outlog}"
+        log  "\nFiles in the source folder with '[ TRANSCODING... ]' in their name are currently"
+        log  "\nBeing transcoded and will be renamed without this text once transcoding is complete"
+        log  "\nSource encoding: ${MediaInfo['Format']}\
+                \n\tReduction: ${perc}\n\tOriginal bitrate: ${MediaInfo['BitRate']}K\
+                \n\tTarget bitrate: ${maxrate}\n\tCodec: ${codec}" 2>&1 | tee "${outlog}"
+        #
+        # log  "\tffmpeg -loglevel ${loglevel} -hide_banner -i (Source file) \n \
+        #         -c:v ${codec}   \n \
+        #         -vf \"scale=${maxwidth}:-2,fps=fps=${MediaInfo['FrameRate']}\" \n \
+        #         -pix_fmt yuv420p \n \
+        #         -c:a copy \n \
+        #         -movflags +faststart (Working file)\n" # | tee -a "${outlog}"
+
+        log "ffmpeg command line:\n"
+        log      "\n\t${NICE} ${ffmpeg} \n \
+                 -hide_banner \n \
+                 -loglevel ${loglevel} -hide_banner -i \$\{Source_file\} \n \
+                 -c:v ${codec} \n \
+                 -vf "scale=${maxwidth}:-2,fps=fps=${MediaInfo['FrameRate']}"\n \
+                 -pix_fmt yuv420p n\ \
+                 -c:a copy \n \
+                 -movflags +faststart \n \
+                 ${Output_file} "
+
+        # log  "Framerate ${MediaInfo['FrameRate']} is copied from source"  # | tee -a "${outlog}"
+        # log  "This may slow things down or mess things up - see comments for the thinking here"  # | tee testing -a "${outlog}"
+        #        I was getting lots of duplicate frames and the docs seem to indicate
+        #        that the process eiter drops or adds frames to keep the framerate right
+        #        if this is so, i'm trying to force new framerate to exactly the same as the old one
+        #        to see if we eliminate the problem
+        #
+        # Not using Framerate anymore
+
+        # the following combinations on a source file  at 5400x2700 with 31984 kbs
+        #  -preset fast -crf 18 -maxrate 35M yielded 4096x2048 at 13890 kbs
+        #  -b:v 35M yielded  4096x2048 321701 kbs
+        # latter result was good and clean while the first was blocky and ugly
+        # both run at about .6 speed which is excellent compared with libx265 which ran at .1 to .01 speed and took
+        # forever to work out optimal settings in preset to get the filesize kbps I was going for
+        #
+        # If you are reading this and thinking - that I misread the docs - no I didnt
+        # These comments have been put in here incrementaly over the space of a couple of years
+        # some more recent than others - for instance, I'm aware the crf 18 is pretty crap and preset fast adds to
+        # tne crappiness
+        #
+        if [ -z "${dryrun}" ]
+        then
+          log  "............................................" # | tee -a "${outlog}"
+          log  "        ffmpeg output follows                " # | tee -a "${outlog}"
+          log  "............................................\n" # | tee -a "${outlog}"
+          start=$(date +%s.%N)
+          if [ -z "${DEBUG}" ]
+          then
+            log  "Transcoding File" # | tee -a "${outlog}"
+            ${NICE} ${ffmpeg}  \
+             -hide_banner \
+             -loglevel ${loglevel} -hide_banner -i "${Source_file}" \
+             -c:v ${codec} \
+             -vf "scale=${maxwidth}:-2,fps=fps=${MediaInfo['FrameRate']}"\
+             -pix_fmt yuv420p \
+             -c:a copy \
+             -movflags +faststart \
+             "${Output_file}" 2>&1  | tee -a "${outlog}"
+          else # for debugging using -ss to start 2 mins in and -t to process only 2 minute of video
+            log  "DEBUG is ON- only transcoding 1 minute of video" # | tee -a "${outlog}"
+            ${NICE} ${ffmpeg}  \
+            -hide_banner \
+            -ss 00:02:00 \
+            -loglevel ${loglevel} -hide_banner -i "${Source_file}" \
+            -c:v ${codec} \
+            -vf "scale=${maxwidth}:-2,fps=fps=${MediaInfo['FrameRate']}"\
+            -pix_fmt yuv420p \
+            -c:a copy \
+            -movflags +faststart \
+            -t 00:01:00 \
+            "${Output_file}" 2>&1  | tee -a "${outlog}"
+          fi
+         end=$(date +%s.%N)
+         duration=$( echo "$end - $start" | bc -l )
+         duration=$(printf "%.0f\n" "${duration}" )
+         duration=$(printf '%02dh:%02dm:%02ds\n' $((duration/3600)) $((duration%3600/60)) $((duration%60)))
+         log "ffmpeg took ${duration}"
+        fi
+    else
+        log "\nFile exists :\n\t${Output_file}\n\t So skipping encoding"
+		fi
+    if [ -f  "${Output_file}" ]
+    then
+      # process our temp output file name and clead it up back to what it should be
+      get_newname "${Output_file}"
+      ${dryrun} mv -n "${Output_file}" "${new_dest_folder}/${target_file}"
+      ${dryrun} mv -n "${outlog}" "${new_dest_folder}/${logfile}"
+    fi
+    fin "${Output_file}"
+	fi
+done
+
+# With custom compiled ffmpeg:
+# Starting second pass: moving the moov atom to the beginning of the filex elapsed=0:10:48.15
+# [out#0/mp4 @ 0x63ca5999fac0] video:1852082KiB audio:21955KiB subtitle:0KiB other streams:0KiB global headers:0KiB muxing overhead: 0.063229%
+# frame=44278 fps= 68 q=19.0 Lsize= 1875222KiB time=00:12:17.93 bitrate=20817.4kbits/s speed=1.14x elapsed=0:10:50.08
+# ffmpeg took 00h:10m:51s
+# ds4quest 1.1rc1 (/home/martin/bin/ds4quest) :  - Done!
+#
+# With ubuntu package ffmpeg:
+# Starting second pass: moving the moov atom to the beginning of the filex elapsed=0:11:02.23
+# [out#0/mp4 @ 0x5bed6f364ac0] video:1852082KiB audio:21955KiB subtitle:0KiB other streams:0KiB global headers:0KiB muxing overhead: 0.063229%
+# frame=44278 fps= 67 q=19.0 Lsize= 1875222KiB time=00:12:17.93 bitrate=20817.4kbits/s speed=1.11x elapsed=0:11:04.25
+# ffmpeg took 00h:11m:05s
+# ds4quest 1.1rc1 (/home/martin/bin/ds4quest) :  - Done!
+#
+#
+# The above shows a slight improvement in performance with a custom build of ffmpeg
+# using my build script, which incidentally is a script that exactly duplicates the steps
+# provided in https://trac.ffmpeg.org/wiki/CompilationGuide/Ubuntu
+#
